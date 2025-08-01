@@ -620,7 +620,7 @@ impl ConsensusEncode for ControlBlock {
         let mut counter = 1;
 
         let first_byte =
-            self.leaf_version.to_consensus_u8() & self.output_key_parity.to_consensus_u8();
+            self.leaf_version.to_consensus_u8() | self.output_key_parity.to_consensus_u8();
         first_byte.consensus_encode(writer)?;
 
         counter += self.internal_pk.consensus_encode(writer)?;
