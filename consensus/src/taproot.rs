@@ -24,12 +24,10 @@
 
 #![allow(unused_braces)] // required due to strict dumb derivation and compiler bug
 
-use std::borrow::Borrow;
 use std::fmt::{self, Formatter, LowerHex, UpperHex};
 use std::ops::BitXor;
 use std::str::FromStr;
-use std::{cmp, io, slice, vec};
-
+use std::{io, slice, vec};
 use amplify::confinement::Confined;
 use amplify::hex::FromHex;
 use amplify::{confinement, ByteArray, Bytes32, Wrapper};
@@ -341,8 +339,16 @@ pub struct TapBranchHash(
 impl TapBranchHash {
     pub fn with_nodes(node1: TapNodeHash, node2: TapNodeHash) -> Self {
         let mut engine = Sha256::from_tag(MIDSTATE_TAPBRANCH);
-        engine.input_raw(cmp::min(&node1, &node2).borrow());
-        engine.input_raw(cmp::max(&node1, &node2).borrow());
+
+        // [BUG 修复] 直接比较字节数组以确保正确的字典序排序
+        if node1.to_byte_array() < node2.to_byte_array() {
+            engine.input_raw(node1.0.as_slice());
+            engine.input_raw(node2.0.as_slice());
+        } else {
+            engine.input_raw(node2.0.as_slice());
+            engine.input_raw(node1.0.as_slice());
+        }
+
         Self(engine.finish().into())
     }
 }
