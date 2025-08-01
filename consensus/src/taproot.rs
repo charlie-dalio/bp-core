@@ -368,24 +368,26 @@ impl IntoTapHash for TapNodeHash {
     fn into_tap_hash(self) -> TapNodeHash { self }
 }
 
+
 #[derive(Wrapper, WrapperMut, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From, Default)]
 #[wrapper(Deref)]
 #[wrapper_mut(DerefMut)]
 #[derive(StrictType, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
-pub struct TapMerklePath(Confined<Vec<TapBranchHash>, 0, 128>);
+// [BUG 修复] 默克尔路径应该由一系列节点哈希（兄弟节点）组成，而不是分支哈希。
+pub struct TapMerklePath(Confined<Vec<TapNodeHash>, 0, 128>);
 
 impl IntoIterator for TapMerklePath {
-    type Item = TapBranchHash;
-    type IntoIter = vec::IntoIter<TapBranchHash>;
+    type Item = TapNodeHash;
+    type IntoIter = vec::IntoIter<TapNodeHash>;
 
     fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
 }
 
 impl<'a> IntoIterator for &'a TapMerklePath {
-    type Item = &'a TapBranchHash;
-    type IntoIter = slice::Iter<'a, TapBranchHash>;
+    type Item = &'a TapNodeHash;
+    type IntoIter = slice::Iter<'a, TapNodeHash>;
 
     fn into_iter(self) -> Self::IntoIter { self.0.iter() }
 }
@@ -396,7 +398,7 @@ impl TapMerklePath {
     // We can't use `impl TryFrom` due to the conflict with core library blanked
     // implementation
     #[inline]
-    pub fn try_from(path: Vec<TapBranchHash>) -> Result<Self, confinement::Error> {
+    pub fn try_from(path: Vec<TapNodeHash>) -> Result<Self, confinement::Error> {
         Confined::try_from(path).map(Self::from_inner)
     }
 
@@ -404,7 +406,7 @@ impl TapMerklePath {
     /// from an iterator. Fails if the number of items in the collection
     /// exceeds one of the confinement bounds.
     #[inline]
-    pub fn try_from_iter<I: IntoIterator<Item = TapBranchHash>>(
+    pub fn try_from_iter<I: IntoIterator<Item = TapNodeHash>>(
         iter: I,
     ) -> Result<Self, confinement::Error> {
         Confined::try_from_iter(iter).map(Self::from_inner)

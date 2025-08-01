@@ -27,13 +27,7 @@ use std::io::{self, Cursor, Read, Write};
 use amplify::confinement::{Confined, MediumBlob, SmallBlob, TinyBlob, U32};
 use amplify::{confinement, ByteArray, Bytes32, IoError, Wrapper};
 
-use crate::{
-    Annex, Block, BlockHash, BlockHeader, BlockMerkleRoot, ControlBlock, InternalPk,
-    InvalidLeafVer, LeafVer, LockTime, Outpoint, Parity, RedeemScript, Sats, ScriptBytes,
-    ScriptPubkey, SeqNo, SigScript, Sighash, TapBranchHash, TapLeafHash, TapMerklePath, TapScript,
-    Tx, TxIn, TxOut, TxVer, Txid, Vout, Witness, WitnessScript, LIB_NAME_BITCOIN,
-    TAPROOT_ANNEX_PREFIX,
-};
+use crate::{Annex, Block, BlockHash, BlockHeader, BlockMerkleRoot, ControlBlock, InternalPk, InvalidLeafVer, LeafVer, LockTime, Outpoint, Parity, RedeemScript, Sats, ScriptBytes, ScriptPubkey, SeqNo, SigScript, Sighash, TapBranchHash, TapLeafHash, TapMerklePath, TapNodeHash, TapScript, Tx, TxIn, TxOut, TxVer, Txid, Vout, Witness, WitnessScript, LIB_NAME_BITCOIN, TAPROOT_ANNEX_PREFIX};
 
 /// Bitcoin consensus allows arrays which length is encoded as VarInt to grow up
 /// to 64-bit values. However, at the same time no consensus rule allows any
@@ -606,6 +600,21 @@ impl ConsensusDecode for TapBranchHash {
     }
 }
 
+// [BUG 修复] 为 TapNodeHash 添加共识编码/解码实现
+impl ConsensusEncode for TapNodeHash {
+    fn consensus_encode(&self, writer: &mut impl Write) -> Result<usize, IoError> {
+        writer.write_all(&self.to_byte_array())?;
+        Ok(32)
+    }
+}
+
+impl ConsensusDecode for TapNodeHash {
+    fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
+        let mut buf = [0u8; 32];
+        reader.read_exact(&mut buf)?;
+        Ok(TapNodeHash::from_byte_array(buf))
+    }
+}
 impl ConsensusDecode for InternalPk {
     fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
         let mut buf = [0u8; 32];
@@ -642,13 +651,12 @@ impl ConsensusDecode for ControlBlock {
 
         let mut buf = vec![];
         reader.read_to_end(&mut buf)?;
-        let mut iter = buf.chunks_exact(32);
-        let merkle_branch = iter.by_ref().map(TapBranchHash::from_slice_checked);
-        let merkle_branch = TapMerklePath::try_from_iter(merkle_branch)
-            .map_err(|_| ConsensusDataError::LongTapMerklePath)?;
-        if !iter.remainder().is_empty() {
+        if buf.len() % 32 != 0 { // 路径的长度必须是 32 的倍数
             return Err(ConsensusDataError::InvalidTapMerklePath.into());
         }
+        let iter = buf.chunks_exact(32).map(TapNodeHash::from_slice_checked);
+        let merkle_branch = TapMerklePath::try_from_iter(iter)
+            .map_err(|_| ConsensusDataError::LongTapMerklePath)?;
 
         Ok(ControlBlock {
             leaf_version,
