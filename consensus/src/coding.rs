@@ -27,7 +27,7 @@ use std::io::{self, Cursor, Read, Write};
 use amplify::confinement::{Confined, MediumBlob, SmallBlob, TinyBlob, U32};
 use amplify::{confinement, ByteArray, Bytes32, IoError, Wrapper};
 
-use crate::{Annex, Block, BlockHash, BlockHeader, BlockMerkleRoot, ControlBlock, InternalPk, InvalidLeafVer, LeafVer, LockTime, Outpoint, Parity, RedeemScript, Sats, ScriptBytes, ScriptPubkey, SeqNo, SigScript, Sighash, TapBranchHash, TapLeafHash, TapMerklePath, TapNodeHash, TapScript, Tx, TxIn, TxOut, TxVer, Txid, Vout, Witness, WitnessScript, LIB_NAME_BITCOIN, TAPROOT_ANNEX_PREFIX};
+use crate::{Annex, Block, BlockHash, BlockHeader, BlockMerkleRoot, InternalPk, InvalidLeafVer, LockTime, Outpoint, RedeemScript, Sats, ScriptBytes, ScriptPubkey, SeqNo, SigScript, Sighash, TapBranchHash, TapLeafHash, TapScript, Tx, TxIn, TxOut, TxVer, Txid, Vout, Witness, WitnessScript, LIB_NAME_BITCOIN, TAPROOT_ANNEX_PREFIX};
 
 /// Bitcoin consensus allows arrays which length is encoded as VarInt to grow up
 /// to 64-bit values. However, at the same time no consensus rule allows any
@@ -600,21 +600,7 @@ impl ConsensusDecode for TapBranchHash {
     }
 }
 
-// [BUG 修复] 为 TapNodeHash 添加共识编码/解码实现
-impl ConsensusEncode for TapNodeHash {
-    fn consensus_encode(&self, writer: &mut impl Write) -> Result<usize, IoError> {
-        writer.write_all(&self.to_byte_array())?;
-        Ok(32)
-    }
-}
 
-impl ConsensusDecode for TapNodeHash {
-    fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
-        let mut buf = [0u8; 32];
-        reader.read_exact(&mut buf)?;
-        Ok(TapNodeHash::from_byte_array(buf))
-    }
-}
 impl ConsensusDecode for InternalPk {
     fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
         let mut buf = [0u8; 32];
@@ -624,48 +610,7 @@ impl ConsensusDecode for InternalPk {
     }
 }
 
-impl ConsensusEncode for ControlBlock {
-    fn consensus_encode(&self, writer: &mut impl Write) -> Result<usize, IoError> {
-        let mut counter = 1;
 
-        let first_byte =
-            self.leaf_version.to_consensus_u8() | self.output_key_parity.to_consensus_u8();
-        first_byte.consensus_encode(writer)?;
-
-        counter += self.internal_pk.consensus_encode(writer)?;
-        for step in &self.merkle_branch {
-            counter += step.consensus_encode(writer)?;
-        }
-
-        Ok(counter)
-    }
-}
-
-impl ConsensusDecode for ControlBlock {
-    fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
-        let first_byte = u8::consensus_decode(reader)?;
-        let leaf_version = LeafVer::from_consensus_u8(first_byte & 0xFE)?;
-        let output_key_parity = Parity::from_consensus_u8(first_byte & 0x01).expect("binary value");
-
-        let internal_key = InternalPk::consensus_decode(reader)?;
-
-        let mut buf = vec![];
-        reader.read_to_end(&mut buf)?;
-        if buf.len() % 32 != 0 { // 路径的长度必须是 32 的倍数
-            return Err(ConsensusDataError::InvalidTapMerklePath.into());
-        }
-        let iter = buf.chunks_exact(32).map(TapNodeHash::from_slice_checked);
-        let merkle_branch = TapMerklePath::try_from_iter(iter)
-            .map_err(|_| ConsensusDataError::LongTapMerklePath)?;
-
-        Ok(ControlBlock {
-            leaf_version,
-            output_key_parity,
-            internal_pk: internal_key,
-            merkle_branch,
-        })
-    }
-}
 
 impl ConsensusEncode for Sats {
     fn consensus_encode(&self, writer: &mut impl Write) -> Result<usize, IoError> {

@@ -17,6 +17,7 @@ name = "bc"
 
 [dependencies]
 amplify = { workspace = true }
+bitcoin_hashes = "0.16"
 strict_encoding = { workspace = true }
 strict_types = { workspace = true, optional = true }
 commit_verify = { workspace = true }

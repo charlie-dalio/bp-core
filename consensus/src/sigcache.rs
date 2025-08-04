@@ -26,7 +26,7 @@ use std::borrow::Borrow;
 
 use amplify::{Bytes32, IoError};
 use commit_verify::{Digest, DigestExt, Sha256};
-
+use bitcoin_hashes::{sha256};
 use crate::{
     Annex, ConsensusEncode, Sats, ScriptCode, ScriptPubkey, SeqNo, SigScript, Sighash, SighashFlag,
     SighashType, TapLeafHash, TapSighash, Tx as Transaction, TxIn, TxOut, Txid, VarIntArray,
@@ -152,7 +152,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         leaf_hash_code_separator: Option<(TapLeafHash, u32)>,
         sighash_type: Option<SighashType>,
     ) -> Result<TapSighash, SighashError> {
-        let mut hasher = TapSighash::engine();
+        let mut hasher: sha256::HashEngine = TapSighash::engine();
 
         let SighashType {
             flag: sighash_flag,

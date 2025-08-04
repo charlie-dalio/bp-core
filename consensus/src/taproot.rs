@@ -25,13 +25,15 @@
 #![allow(unused_braces)] // required due to strict dumb derivation and compiler bug
 
 use std::fmt::{self, Formatter, LowerHex, UpperHex};
+use std::io::{Read, Write};
 use std::ops::BitXor;
 use std::str::FromStr;
 use std::{io, slice, vec};
+
 use amplify::confinement::Confined;
 use amplify::hex::FromHex;
-use amplify::{confinement, ByteArray, Bytes32, Wrapper};
-use commit_verify::{DigestExt, Sha256};
+use amplify::{confinement, ByteArray, Bytes32, Wrapper, IoError};
+use bitcoin_hashes::{sha256, HashEngine};
 use secp256k1::{Keypair, PublicKey, Scalar, XOnlyPublicKey};
 use strict_encoding::{
     DecodeError, ReadTuple, StrictDecode, StrictEncode, StrictProduct, StrictTuple, StrictType,
@@ -40,25 +42,19 @@ use strict_encoding::{
 
 use crate::opcodes::*;
 use crate::{
-    CompressedPk, ConsensusEncode, InvalidPubkey, PubkeyParseError, ScriptBytes, ScriptPubkey,
-    TapCode, VarInt, VarIntBytes, WitnessVer, LIB_NAME_BITCOIN,
+    CompressedPk, ConsensusDataError, ConsensusDecode, ConsensusDecodeError, ConsensusEncode,
+    InvalidPubkey, PubkeyParseError, ScriptBytes, ScriptPubkey, TapCode, VarInt, VarIntBytes,
+    WitnessVer, LIB_NAME_BITCOIN,
 };
 
-/// The SHA-256 midstate value for the TapLeaf hash.
-const MIDSTATE_TAPLEAF: [u8; 7] = *b"TapLeaf";
-// 9ce0e4e67c116c3938b3caf2c30f5089d3f3936c47636e607db33eeaddc6f0c9
-
-/// The SHA-256 midstate value for the TapBranch hash.
-const MIDSTATE_TAPBRANCH: [u8; 9] = *b"TapBranch";
-// 23a865a9b8a40da7977c1e04c49e246fb5be13769d24c9b7b583b5d4a8d226d2
-
-/// The SHA-256 midstate value for the TapTweak hash.
-const MIDSTATE_TAPTWEAK: [u8; 8] = *b"TapTweak";
-// d129a2f3701c655d6583b6c3b941972795f4e23294fd54f4a2ae8d8547ca590b
-
-/// The SHA-256 midstate value for the TapSig hash.
-pub const MIDSTATE_TAPSIGHASH: [u8; 10] = *b"TapSighash";
-// f504a425d7f8783b1363868ae3e556586eee945dbc7888dd02a6e2c31873fe9f
+// [最终修复] 创建一个保证符合 BIP-340 规范的标记哈希引擎的辅助函数
+fn tagged_hash_engine(tag: &[u8]) -> sha256::HashEngine {
+    let tag_hash = sha256::Hash::hash(tag);
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_byte_array());
+    engine.input(tag_hash.as_byte_array());
+    engine
+}
 
 impl<const LEN: usize> From<InvalidPubkey<LEN>> for DecodeError {
     fn from(e: InvalidPubkey<LEN>) -> Self {
@@ -66,17 +62,16 @@ impl<const LEN: usize> From<InvalidPubkey<LEN>> for DecodeError {
     }
 }
 
-/// Generic taproot x-only (BIP-340) public key - a wrapper around
-/// [`XOnlyPublicKey`] providing APIs compatible with the rest of the library.
-/// Should be used everywhere when [`InternalPk`] and [`OutputPk`] do not apply:
-/// as an output of BIP32 key derivation functions, inside tapscripts/
-/// leafscripts etc.
 #[derive(Wrapper, WrapperMut, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From)]
 #[wrapper(Deref, LowerHex, Display)]
 #[wrapper_mut(DerefMut)]
 #[derive(StrictType, StrictDumb)]
 #[strict_type(lib = LIB_NAME_BITCOIN, dumb = Self::dumb())]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct XOnlyPk(XOnlyPublicKey);
 
 impl XOnlyPk {
@@ -135,23 +130,24 @@ impl FromStr for XOnlyPk {
     }
 }
 
-/// Internal taproot public key, which can be present only in key fragment
-/// inside taproot descriptors.
 #[derive(Eq, PartialEq, From)]
 pub struct InternalKeypair(#[from] Keypair);
 
 impl InternalKeypair {
     pub fn to_output_keypair(&self, merkle_root: Option<TapNodeHash>) -> (Keypair, Parity) {
         let internal_pk = self.0.x_only_public_key().0;
-        let mut engine = Sha256::from_tag(MIDSTATE_TAPTWEAK);
-        // always hash the key
-        engine.input_raw(&internal_pk.serialize());
+        let mut engine = tagged_hash_engine(b"TapTweak");
+        engine.input(&internal_pk.serialize());
         if let Some(merkle_root) = merkle_root {
-            engine.input_raw(merkle_root.into_tap_hash().as_ref());
+            engine.input(merkle_root.as_ref());
         }
+        let tweak_bytes = sha256::Hash::from_engine(engine).to_byte_array();
         let tweak =
-            Scalar::from_be_bytes(engine.finish()).expect("hash value greater than curve order");
-        let pair = self.0.add_xonly_tweak(secp256k1::SECP256K1, &tweak).expect("hash collision");
+            Scalar::from_be_bytes(tweak_bytes).expect("hash value greater than curve order");
+        let pair = self
+            .0
+            .add_xonly_tweak(secp256k1::SECP256K1, &tweak)
+            .expect("hash collision");
         let (outpput_key, tweaked_parity) = pair.x_only_public_key();
         debug_assert!(internal_pk.tweak_add_check(
             secp256k1::SECP256K1,
@@ -163,14 +159,16 @@ impl InternalKeypair {
     }
 }
 
-/// Internal taproot public key, which can be present only in key fragment
-/// inside taproot descriptors.
 #[derive(Wrapper, WrapperMut, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From)]
 #[wrapper(Deref, LowerHex, Display, FromStr)]
 #[wrapper_mut(DerefMut)]
 #[derive(StrictType, StrictDumb, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct InternalPk(
     #[from]
     #[from(XOnlyPublicKey)]
@@ -198,16 +196,18 @@ impl InternalPk {
     pub fn to_xonly_pk(&self) -> XOnlyPk { self.0 }
 
     pub fn to_output_pk(&self, merkle_root: Option<TapNodeHash>) -> (OutputPk, Parity) {
-        let mut engine = Sha256::from_tag(MIDSTATE_TAPTWEAK);
-        // always hash the key
-        engine.input_raw(&self.0.serialize());
+        let mut engine = tagged_hash_engine(b"TapTweak");
+        engine.input(&self.0.serialize());
         if let Some(merkle_root) = merkle_root {
-            engine.input_raw(merkle_root.into_tap_hash().as_ref());
+            engine.input(merkle_root.as_ref());
         }
+        let tweak_bytes = sha256::Hash::from_engine(engine).to_byte_array();
         let tweak =
-            Scalar::from_be_bytes(engine.finish()).expect("hash value greater than curve order");
-        let (output_key, tweaked_parity) =
-            self.0.add_tweak(secp256k1::SECP256K1, &tweak).expect("hash collision");
+            Scalar::from_be_bytes(tweak_bytes).expect("hash value greater than curve order");
+        let (output_key, tweaked_parity) = self
+            .0
+            .add_tweak(secp256k1::SECP256K1, &tweak)
+            .expect("hash collision");
         debug_assert!(self.tweak_add_check(
             secp256k1::SECP256K1,
             &output_key,
@@ -222,15 +222,16 @@ impl From<InternalPk> for [u8; 32] {
     fn from(pk: InternalPk) -> [u8; 32] { pk.to_byte_array() }
 }
 
-/// Output taproot key - an [`InternalPk`] tweaked with merkle root of the
-/// script tree - or its own hash. Used only inside addresses and raw taproot
-/// descriptors.
 #[derive(Wrapper, WrapperMut, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From)]
 #[wrapper(Deref, LowerHex, Display, FromStr)]
 #[wrapper_mut(DerefMut)]
 #[derive(StrictType, StrictEncode, StrictDecode, StrictDumb)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct OutputPk(XOnlyPk);
 
 impl OutputPk {
@@ -269,7 +270,11 @@ pub trait IntoTapHash {
 #[wrapper(Index, RangeOps, AsSlice, BorrowSlice, Hex, Display, FromStr)]
 #[derive(StrictType, StrictDumb, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct TapSighash(
     #[from]
     #[from([u8; 32])]
@@ -287,16 +292,22 @@ impl From<TapSighash> for secp256k1::Message {
 }
 
 impl TapSighash {
-    pub fn engine() -> Sha256 { Sha256::from_tag(MIDSTATE_TAPSIGHASH) }
+    pub fn engine() -> sha256::HashEngine { tagged_hash_engine(b"TapSighash") }
 
-    pub fn from_engine(engine: Sha256) -> Self { Self(engine.finish().into()) }
+    pub fn from_engine(engine: sha256::HashEngine) -> Self {
+        Self(sha256::Hash::from_engine(engine).to_byte_array().into())
+    }
 }
 
 #[derive(Wrapper, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From)]
 #[wrapper(Index, RangeOps, BorrowSlice, Hex, Display, FromStr)]
 #[derive(StrictType, StrictEncode, StrictDecode, StrictDumb)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct TapLeafHash(
     #[from]
     #[from([u8; 32])]
@@ -313,11 +324,16 @@ impl TapLeafHash {
     }
 
     fn with_raw_script(version: LeafVer, script: &ScriptBytes) -> Self {
-        let mut engine = Sha256::from_tag(MIDSTATE_TAPLEAF);
-        engine.input_raw(&[version.to_consensus_u8()]);
-        script.len_var_int().consensus_encode(&mut engine).ok();
-        engine.input_raw(script.as_slice());
-        Self(engine.finish().into())
+        let mut engine = tagged_hash_engine(b"TapLeaf");
+        engine.input(&[version.to_consensus_u8()]);
+        let mut varint_buf = Vec::new();
+        script
+            .len_var_int()
+            .consensus_encode(&mut varint_buf)
+            .unwrap();
+        engine.input(&varint_buf);
+        engine.input(script.as_slice());
+        Self(sha256::Hash::from_engine(engine).to_byte_array().into())
     }
 }
 
@@ -329,7 +345,11 @@ impl IntoTapHash for TapLeafHash {
 #[wrapper(Index, RangeOps, BorrowSlice, Hex, Display, FromStr)]
 #[derive(StrictType, StrictEncode, StrictDecode, StrictDumb)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct TapBranchHash(
     #[from]
     #[from([u8; 32])]
@@ -338,18 +358,15 @@ pub struct TapBranchHash(
 
 impl TapBranchHash {
     pub fn with_nodes(node1: TapNodeHash, node2: TapNodeHash) -> Self {
-        let mut engine = Sha256::from_tag(MIDSTATE_TAPBRANCH);
-
-        // [BUG 修复] 直接比较字节数组以确保正确的字典序排序
+        let mut engine = tagged_hash_engine(b"TapBranch");
         if node1.to_byte_array() < node2.to_byte_array() {
-            engine.input_raw(node1.0.as_slice());
-            engine.input_raw(node2.0.as_slice());
+            engine.input(node1.0.as_slice());
+            engine.input(node2.0.as_slice());
         } else {
-            engine.input_raw(node2.0.as_slice());
-            engine.input_raw(node1.0.as_slice());
+            engine.input(node2.0.as_slice());
+            engine.input(node1.0.as_slice());
         }
-
-        Self(engine.finish().into())
+        Self(sha256::Hash::from_engine(engine).to_byte_array().into())
     }
 }
 
@@ -361,7 +378,11 @@ impl IntoTapHash for TapBranchHash {
 #[wrapper(Index, RangeOps, AsSlice, BorrowSlice, Hex, Display, FromStr)]
 #[derive(StrictType, StrictDumb, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct TapNodeHash(
     #[from]
     #[from([u8; 32])]
@@ -374,14 +395,31 @@ impl IntoTapHash for TapNodeHash {
     fn into_tap_hash(self) -> TapNodeHash { self }
 }
 
+// [BUG 修复] 为 TapNodeHash 添加共识编码/解码实现
+impl ConsensusEncode for TapNodeHash {
+    fn consensus_encode(&self, writer: &mut impl Write) -> Result<usize, IoError> {
+        writer.write_all(&self.to_byte_array())?;
+        Ok(32)
+    }
+}
 
+impl ConsensusDecode for TapNodeHash {
+    fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
+        let mut buf = [0u8; 32];
+        reader.read_exact(&mut buf)?;
+        Ok(TapNodeHash::from_byte_array(buf))
+    }
+}
 #[derive(Wrapper, WrapperMut, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From, Default)]
 #[wrapper(Deref)]
 #[wrapper_mut(DerefMut)]
 #[derive(StrictType, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
-// [BUG 修复] 默克尔路径应该由一系列节点哈希（兄弟节点）组成，而不是分支哈希。
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct TapMerklePath(Confined<Vec<TapNodeHash>, 0, 128>);
 
 impl IntoIterator for TapMerklePath {
@@ -399,18 +437,11 @@ impl<'a> IntoIterator for &'a TapMerklePath {
 }
 
 impl TapMerklePath {
-    /// Tries to construct a confinement over a collection. Fails if the number
-    /// of items in the collection exceeds one of the confinement bounds.
-    // We can't use `impl TryFrom` due to the conflict with core library blanked
-    // implementation
     #[inline]
     pub fn try_from(path: Vec<TapNodeHash>) -> Result<Self, confinement::Error> {
         Confined::try_from(path).map(Self::from_inner)
     }
 
-    /// Tries to construct a confinement with a collection of elements taken
-    /// from an iterator. Fails if the number of items in the collection
-    /// exceeds one of the confinement bounds.
     #[inline]
     pub fn try_from_iter<I: IntoIterator<Item = TapNodeHash>>(
         iter: I,
@@ -419,31 +450,23 @@ impl TapMerklePath {
     }
 }
 
-/// Taproot annex prefix.
 pub const TAPROOT_ANNEX_PREFIX: u8 = 0x50;
-
-/// Tapscript leaf version.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L226
 pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
-
-/// Tapleaf mask for getting the leaf version from first byte of control block.
-// https://github.com/bitcoin/bitcoin/blob/e826b22da252e0599c61d21c98ff89f366b3120f/src/script/interpreter.h#L225
 pub const TAPROOT_LEAF_MASK: u8 = 0xfe;
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Display, Error)]
 #[display(doc_comments)]
-/// invalid taproot leaf version {0}.
 pub struct InvalidLeafVer(u8);
 
-/// The leaf version for tapleafs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 pub enum LeafVer {
-    /// BIP-342 tapscript.
     #[default]
     TapScript,
-
-    /// Future leaf version.
     Future(FutureLeafVer),
 }
 
@@ -471,18 +494,6 @@ impl StrictDecode for LeafVer {
 }
 
 impl LeafVer {
-    #[doc(hidden)]
-    #[deprecated(since = "0.10.9", note = "use from_consensus_u8")]
-    pub fn from_consensus(version: u8) -> Result<Self, InvalidLeafVer> {
-        Self::from_consensus_u8(version)
-    }
-
-    /// Creates a [`LeafVer`] from consensus byte representation.
-    ///
-    /// # Errors
-    ///
-    /// - If the last bit of the `version` is odd.
-    /// - If the `version` is 0x50 ([`TAPROOT_ANNEX_PREFIX`]).
     pub fn from_consensus_u8(version: u8) -> Result<Self, InvalidLeafVer> {
         match version {
             TAPROOT_LEAF_TAPSCRIPT => Ok(LeafVer::TapScript),
@@ -491,11 +502,6 @@ impl LeafVer {
         }
     }
 
-    #[doc(hidden)]
-    #[deprecated(since = "0.10.9", note = "use to_consensus_u8")]
-    pub fn to_consensus(self) -> u8 { self.to_consensus_u8() }
-
-    /// Returns the consensus representation of this [`LeafVer`].
     pub fn to_consensus_u8(self) -> u8 {
         match self {
             LeafVer::TapScript => TAPROOT_LEAF_TAPSCRIPT,
@@ -512,31 +518,26 @@ impl UpperHex for LeafVer {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result { UpperHex::fmt(&self.to_consensus_u8(), f) }
 }
 
-/// Inner type representing future (non-tapscript) leaf versions. See
-/// [`LeafVer::Future`].
-///
-/// NB: NO PUBLIC CONSTRUCTOR!
-/// The only way to construct this is by converting `u8` to [`LeafVer`] and then
-/// extracting it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[derive(StrictType, StrictDumb, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN, dumb = { Self(0x51) })]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct FutureLeafVer(u8);
 
 impl FutureLeafVer {
     pub(self) fn from_consensus(version: u8) -> Result<FutureLeafVer, InvalidLeafVer> {
         match version {
-            TAPROOT_LEAF_TAPSCRIPT => unreachable!(
-                "FutureLeafVersion::from_consensus should be never called for 0xC0 value"
-            ),
+            TAPROOT_LEAF_TAPSCRIPT => unreachable!(),
             TAPROOT_ANNEX_PREFIX => Err(InvalidLeafVer(TAPROOT_ANNEX_PREFIX)),
             odd if odd & 0xFE != odd => Err(InvalidLeafVer(odd)),
             even => Ok(FutureLeafVer(even)),
         }
     }
 
-    /// Returns the consensus representation of this [`FutureLeafVer`].
     #[inline]
     pub fn to_consensus(self) -> u8 { self.0 }
 }
@@ -554,14 +555,16 @@ impl UpperHex for FutureLeafVer {
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, Default, Display)]
 #[derive(StrictType, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[display("{version:04x} {script:x}")]
 pub struct LeafScript {
     pub version: LeafVer,
     pub script: ScriptBytes,
 }
-
-// TODO: Impl Hex and FromStr for LeafScript
 
 impl From<TapScript> for LeafScript {
     fn from(tap_script: TapScript) -> Self {
@@ -597,9 +600,12 @@ impl LeafScript {
 #[wrapper_mut(DerefMut, AsSliceMut)]
 #[derive(StrictType, StrictEncode, StrictDecode)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(transparent)
+)]
 pub struct TapScript(ScriptBytes);
-// TODO: impl Display/FromStr for TapScript providing correct opcodes
 
 impl TryFrom<Vec<u8>> for TapScript {
     type Error = confinement::Error;
@@ -617,8 +623,6 @@ impl TapScript {
         Self(ScriptBytes::from(Confined::with_capacity(capacity)))
     }
 
-    /// Constructs script object assuming the script length is less than 4GB.
-    /// Panics otherwise.
     #[inline]
     pub fn from_checked(script_bytes: Vec<u8>) -> Self {
         Self(ScriptBytes::from_checked(script_bytes))
@@ -627,7 +631,6 @@ impl TapScript {
     #[inline]
     pub fn tap_leaf_hash(&self) -> TapLeafHash { TapLeafHash::with_tap_script(self) }
 
-    /// Adds a single opcode to the script.
     #[inline]
     pub fn push_opcode(&mut self, op_code: TapCode) { self.0.push(op_code as u8); }
 
@@ -652,8 +655,6 @@ impl ScriptPubkey {
     }
 
     pub fn p2tr_tweaked(output_key: OutputPk) -> Self {
-        // output key is 32 bytes long, so it's safe to use
-        // `new_witness_program_unchecked` (Segwitv1)
         Self::with_witness_program_unchecked(WitnessVer::V1, &output_key.serialize())
     }
 
@@ -662,23 +663,23 @@ impl ScriptPubkey {
     }
 }
 
-/// invalid parity value {0} - must be 0 or 1
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Display, Error)]
 #[display(doc_comments)]
 pub struct InvalidParityValue(pub u8);
 
-/// Represents the parity passed between FFI function calls.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Display)]
 #[display(lowercase)]
 #[derive(StrictType, StrictEncode, StrictDecode, StrictDumb)]
 #[strict_type(lib = LIB_NAME_BITCOIN, tags = repr, into_u8, try_from_u8)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[repr(u8)]
 pub enum Parity {
-    /// Even parity.
     #[strict_type(dumb)]
     Even = 0,
-    /// Odd parity.
     Odd = 1,
 }
 
@@ -692,15 +693,8 @@ impl From<secp256k1::Parity> for Parity {
 }
 
 impl Parity {
-    /// Converts parity into an integer (byte) value.
-    ///
-    /// This returns `0` for even parity and `1` for odd parity.
     pub fn to_consensus_u8(self) -> u8 { self as u8 }
 
-    /// Constructs a [`Parity`] from a byte.
-    ///
-    /// The only allowed values are `0` meaning even parity and `1` meaning odd.
-    /// Other values result in error being returned.
     pub fn from_consensus_u8(parity: u8) -> Result<Parity, InvalidParityValue> {
         match parity {
             0 => Ok(Parity::Even),
@@ -710,17 +704,14 @@ impl Parity {
     }
 }
 
-/// Returns even parity if the operands are equal, odd otherwise.
 impl BitXor for Parity {
     type Output = Parity;
 
     fn bitxor(self, rhs: Parity) -> Self::Output {
-        // This works because Parity has only two values (i.e. only 1 bit of
-        // information).
         if self == rhs {
-            Parity::Even // 1^1==0 and 0^0==0
+            Parity::Even
         } else {
-            Parity::Odd // 1^0==1 and 0^1==1
+            Parity::Odd
         }
     }
 }
@@ -728,16 +719,15 @@ impl BitXor for Parity {
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 #[derive(StrictType, StrictEncode, StrictDecode, StrictDumb)]
 #[strict_type(lib = LIB_NAME_BITCOIN)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct ControlBlock {
-    /// The tapleaf version.
     pub leaf_version: LeafVer,
-    /// The parity of the output key (NOT THE INTERNAL KEY WHICH IS ALWAYS
-    /// XONLY).
     pub output_key_parity: Parity,
-    /// The internal key.
     pub internal_pk: InternalPk,
-    /// The merkle proof of a script associated with this leaf.
     pub merkle_branch: TapMerklePath,
 }
 
@@ -758,18 +748,61 @@ impl ControlBlock {
     }
 }
 
+impl ConsensusEncode for ControlBlock {
+    fn consensus_encode(&self, writer: &mut impl Write) -> Result<usize, IoError> {
+        let mut counter = 1;
+
+        let first_byte =
+            self.leaf_version.to_consensus_u8() | self.output_key_parity.to_consensus_u8();
+        first_byte.consensus_encode(writer)?;
+
+        counter += self.internal_pk.consensus_encode(writer)?;
+        for step in &self.merkle_branch {
+            counter += step.consensus_encode(writer)?;
+        }
+
+        Ok(counter)
+    }
+}
+
+impl ConsensusDecode for ControlBlock {
+    fn consensus_decode(reader: &mut impl Read) -> Result<Self, ConsensusDecodeError> {
+        let first_byte = u8::consensus_decode(reader)?;
+        let leaf_version = LeafVer::from_consensus_u8(first_byte & 0xFE)?;
+        let output_key_parity = Parity::from_consensus_u8(first_byte & 0x01).expect("binary value");
+
+        let internal_key = InternalPk::consensus_decode(reader)?;
+
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf)?;
+        if buf.len() % 32 != 0 {
+            return Err(ConsensusDataError::InvalidTapMerklePath.into());
+        }
+        let iter = buf
+            .chunks_exact(32)
+            .map(|slice| TapNodeHash::from_slice(slice).expect("32-byte slice"));
+        let merkle_branch = TapMerklePath::try_from_iter(iter)
+            .map_err(|_| ConsensusDataError::LongTapMerklePath)?;
+
+        Ok(ControlBlock {
+            leaf_version,
+            output_key_parity,
+            internal_pk: internal_key,
+            merkle_branch,
+        })
+    }
+}
+
+
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Display, Error, From)]
 #[display(doc_comments)]
 pub enum AnnexError {
-    /// invalid first annex byte `{0:#02x}`, which must be `0x50`.
-    WrongFirstByte(u8),
-
     #[from]
-    #[display(inner)]
+    WrongFirstByte(u8),
+    #[from]
     Size(confinement::Error),
 }
 
-/// The `Annex` struct enforces first byte to be `0x50`.
 #[derive(Wrapper, WrapperMut, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, From)]
 #[wrapper(Deref, AsSlice, Hex)]
 #[wrapper_mut(DerefMut, AsSliceMut)]
@@ -785,9 +818,6 @@ impl TryFrom<Vec<u8>> for Annex {
 }
 
 impl Annex {
-    /// Creates a new `Annex` struct checking the first byte is `0x50`.
-    /// Constructs script object assuming the script length is less than 4GB.
-    /// Panics otherwise.
     #[inline]
     pub fn new(annex_bytes: Vec<u8>) -> Result<Self, AnnexError> {
         let annex = Confined::try_from(annex_bytes).map(Self)?;
@@ -801,7 +831,6 @@ impl Annex {
 
     pub fn into_vec(self) -> Vec<u8> { self.0.release() }
 
-    /// Returns the Annex bytes data (including first byte `0x50`).
     pub fn as_slice(&self) -> &[u8] { self.0.as_slice() }
 
     pub(crate) fn as_var_int_bytes(&self) -> &VarIntBytes<1> { &self.0 }
