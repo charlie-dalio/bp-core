@@ -24,9 +24,9 @@
 
 use std::borrow::Borrow;
 
-use amplify::{Bytes32, IoError};
-use commit_verify::{Digest, DigestExt, Sha256};
-use bitcoin_hashes::{sha256};
+use amplify::{ByteArray, Bytes32, IoError};
+use commit_verify::{Digest, Sha256};
+use bitcoin_hashes::{sha256, HashEngine};
 use crate::{
     Annex, ConsensusEncode, Sats, ScriptCode, ScriptPubkey, SeqNo, SigScript, Sighash, SighashFlag,
     SighashType, TapLeafHash, TapSighash, Tx as Transaction, TxIn, TxOut, Txid, VarIntArray,
@@ -152,32 +152,22 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         leaf_hash_code_separator: Option<(TapLeafHash, u32)>,
         sighash_type: Option<SighashType>,
     ) -> Result<TapSighash, SighashError> {
-        let mut hasher: sha256::HashEngine = TapSighash::engine();
+        let mut hasher = TapSighash::engine();
 
         let SighashType {
             flag: sighash_flag,
             anyone_can_pay,
         } = sighash_type.unwrap_or_default();
+        let common_cache = *self.common_cache();
+        let taproot_cache = *self.taproot_cache();
 
-        // epoch
-        0u8.consensus_encode(&mut hasher)?;
 
-        // * Control:
-        // hash_type (1).
-        match sighash_type {
-            None => 0u8.consensus_encode(&mut hasher)?,
-            Some(sighash_type) => sighash_type.to_consensus_u8().consensus_encode(&mut hasher)?,
-        };
+        let tx = self.tx.borrow();
+        hasher.input(&[0u8]); // epoch
+        hasher.input(&[sighash_type.unwrap_or_default().into_consensus_u8()]);
 
-        {
-            let tx = self.tx.borrow();
-            // * Transaction Data:
-            // nVersion (4): the nVersion of the transaction.
-            tx.version.consensus_encode(&mut hasher)?;
-
-            // nLockTime (4): the nLockTime of the transaction.
-            tx.lock_time.consensus_encode(&mut hasher)?;
-        }
+        tx.version.consensus_encode(&mut hasher)?;
+        tx.lock_time.consensus_encode(&mut hasher)?;
 
         // If the hash_type & 0x80 does not equal SIGHASH_ANYONECANPAY:
         //     sha_prevouts (32): the SHA256 of the serialization of all input
@@ -187,17 +177,17 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         // sha_sequences (32): the SHA256 of the serialization of all
         // input nSequence.
         if !anyone_can_pay {
-            self.common_cache().prevouts.consensus_encode(&mut hasher)?;
-            self.taproot_cache().amounts.consensus_encode(&mut hasher)?;
-            self.taproot_cache().script_pubkeys.consensus_encode(&mut hasher)?;
-            self.common_cache().sequences.consensus_encode(&mut hasher)?;
+            hasher.input(&common_cache.prevouts.to_byte_array());
+            hasher.input(&taproot_cache.amounts.to_byte_array());
+            hasher.input(&taproot_cache.script_pubkeys.to_byte_array());
+            hasher.input(&common_cache.sequences.to_byte_array());
         }
 
         // If hash_type & 3 does not equal SIGHASH_NONE or SIGHASH_SINGLE:
         //     sha_outputs (32): the SHA256 of the serialization of all outputs in
         // CTxOut format.
         if sighash_flag != SighashFlag::None && sighash_flag != SighashFlag::Single {
-            self.common_cache().outputs.consensus_encode(&mut hasher)?;
+            hasher.input(&common_cache.outputs.to_byte_array());
         }
 
         // * Data about this input:
@@ -210,9 +200,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         if leaf_hash_code_separator.is_some() {
             spend_type |= 2u8;
         }
-        spend_type.consensus_encode(&mut hasher)?;
-
-        let tx = self.tx.borrow();
+        hasher.input(&[spend_type]);
 
         // If hash_type & 0x80 equals SIGHASH_ANYONECANPAY:
         //      outpoint (36): the COutPoint of this input (32-byte hash + 4-byte
@@ -221,7 +209,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         // output spent by this input, serialized as script inside CTxOut. Its
         // size is always 35 bytes.      nSequence (4): nSequence of this input.
         if anyone_can_pay {
-            let txin = tx.inputs.get(input_index).ok_or(SighashError::InvalidInputIndex {
+            let txin = tx.inputs.get(input_index).ok_or_else(|| SighashError::InvalidInputIndex {
                 txid: tx.txid(),
                 index: input_index,
                 inputs: tx.inputs.len(),
@@ -232,17 +220,17 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
             previous_output.script_pubkey.consensus_encode(&mut hasher)?;
             txin.sequence.consensus_encode(&mut hasher)?;
         } else {
-            (input_index as u32).consensus_encode(&mut hasher)?;
+            hasher.input(&(input_index as u32).to_le_bytes());
         }
 
         // If an annex is present (the lowest bit of spend_type is set):
         //      sha_annex (32): the SHA256 of (compact_size(size of annex) || annex),
         // where annex      includes the mandatory 0x50 prefix.
         if let Some(annex) = annex {
-            let mut enc = Sha256::default();
+            let mut enc = sha256::Hash::engine();
             annex.consensus_encode(&mut enc)?;
-            let hash = enc.finish();
-            hash.consensus_encode(&mut hasher)?;
+            let hash = sha256::Hash::from_engine(enc);
+            hasher.input(hash.as_byte_array());
         }
 
         // * Data about this output:
@@ -250,27 +238,21 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         //      sha_single_output (32): the SHA256 of the corresponding output in CTxOut
         // format.
         if sighash_flag == SighashFlag::Single {
-            let mut enc = Sha256::default();
-            tx.outputs
-                .get(input_index)
-                .ok_or(SighashError::NoSingleOutputMatch {
-                    txid: tx.txid(),
-                    index: input_index,
-                    outputs: tx.outputs.len(),
-                })?
-                .consensus_encode(&mut enc)?;
-            let hash = enc.finish();
-            hash.consensus_encode(&mut hasher)?;
+            let output = tx.outputs.get(input_index).ok_or_else(|| SighashError::NoSingleOutputMatch {
+                txid: tx.txid(),
+                index: input_index,
+                outputs: tx.outputs.len(),
+            })?;
+            let mut enc = sha256::Hash::engine();
+            output.consensus_encode(&mut enc)?;
+            let hash = sha256::Hash::from_engine(enc);
+            hasher.input(hash.as_byte_array());
         }
 
-        //     if (scriptpath):
-        //         ss += TaggedHash("TapLeaf", bytes([leaf_ver]) + ser_string(script))
-        //         ss += bytes([0])
-        //         ss += struct.pack("<i", codeseparator_pos)
         if let Some((hash, code_separator_pos)) = leaf_hash_code_separator {
-            hash.consensus_encode(&mut hasher)?;
-            0u8.consensus_encode(&mut hasher)?;
-            code_separator_pos.consensus_encode(&mut hasher)?;
+            hasher.input(&hash.to_byte_array());
+            hasher.input(&[0u8]);
+            hasher.input(&code_separator_pos.to_le_bytes());
         }
 
         Ok(TapSighash::from_engine(hasher))
@@ -454,20 +436,20 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
     fn common_cache(&mut self) -> &CommonCache {
         let tx = self.tx.borrow();
         self.common_cache.get_or_insert_with(|| {
-            let mut enc_prevouts = Sha256::default();
-            let mut enc_sequences = Sha256::default();
+            let mut enc_prevouts = sha256::Hash::engine();
+            let mut enc_sequences = sha256::Hash::engine();
             for txin in &tx.inputs {
                 let _ = txin.prev_output.consensus_encode(&mut enc_prevouts);
                 let _ = txin.sequence.consensus_encode(&mut enc_sequences);
             }
-            let mut enc_outputs = Sha256::default();
+            let mut enc_outputs = sha256::Hash::engine();
             for txout in &tx.outputs {
                 let _ = txout.consensus_encode(&mut enc_outputs);
             }
             CommonCache {
-                prevouts: enc_prevouts.finish().into(),
-                sequences: enc_sequences.finish().into(),
-                outputs: enc_outputs.finish().into(),
+                prevouts: sha256::Hash::from_engine(enc_prevouts).to_byte_array().into(),
+                sequences: sha256::Hash::from_engine(enc_sequences).to_byte_array().into(),
+                outputs: sha256::Hash::from_engine(enc_outputs).to_byte_array().into(),
             }
         })
     }
@@ -483,15 +465,15 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
 
     fn taproot_cache(&mut self) -> &TaprootCache {
         self.taproot_cache.get_or_insert_with(|| {
-            let mut enc_amounts = Sha256::default();
-            let mut enc_script_pubkeys = Sha256::default();
+            let mut enc_amounts = sha256::Hash::engine();
+            let mut enc_script_pubkeys = sha256::Hash::engine();
             for prevout in &self.prevouts {
                 let _ = prevout.borrow().value.consensus_encode(&mut enc_amounts);
                 let _ = prevout.borrow().script_pubkey.consensus_encode(&mut enc_script_pubkeys);
             }
             TaprootCache {
-                amounts: enc_amounts.finish().into(),
-                script_pubkeys: enc_script_pubkeys.finish().into(),
+                amounts: sha256::Hash::from_engine(enc_amounts).to_byte_array().into(),
+                script_pubkeys: sha256::Hash::from_engine(enc_script_pubkeys).to_byte_array().into(),
             }
         })
     }
