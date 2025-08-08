@@ -32,6 +32,19 @@ use crate::{
     SighashType, TapLeafHash, TapSighash, Tx as Transaction, TxIn, TxOut, Txid, VarIntArray,
 };
 
+fn tagged_hash_engine(tag: &'static str) -> sha256::HashEngine {
+    // 1. 计算 tag 的哈希
+    let mut tag_engine = sha256::Hash::engine();
+    tag_engine.input(tag.as_bytes());
+    let tag_hash = sha256::Hash::from_engine(tag_engine);
+
+    // 2. 创建最终的引擎，并用 tag_hash 作为前缀输入两次
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag_hash.as_byte_array());
+    engine.input(tag_hash.as_byte_array());
+
+    engine
+}
 /// Used for signature hash for invalid use of SIGHASH_SINGLE.
 const UINT256_ONE: [u8; 32] = [
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -152,7 +165,8 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         leaf_hash_code_separator: Option<(TapLeafHash, u32)>,
         sighash_type: Option<SighashType>,
     ) -> Result<TapSighash, SighashError> {
-        let mut hasher = TapSighash::engine();
+
+        let mut hasher = tagged_hash_engine("TapSighash");
 
         let SighashType {
             flag: sighash_flag,
