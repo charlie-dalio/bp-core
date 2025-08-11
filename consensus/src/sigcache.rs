@@ -176,7 +176,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         // 2. 写入头部数据 (8 字节)
         engine.input(&[0u8]); // epoch
         engine.input(&[sighash_type.into_consensus_u8()]);
-        engine.input(&tx.version.to_consensus_u32().to_le_bytes());
+        engine.input(&tx.version.to_consensus_i32().to_le_bytes());
         engine.input(&tx.lock_time.to_consensus_u32().to_le_bytes());
 
         // 3. 写入 Prevouts, Amounts, ScriptPubkeys, Sequences 的哈希 (4 * 32 = 128 字节)
@@ -250,7 +250,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
 
         // 9. 写入脚本花费的数据 (如果存在)
         if let Some((leaf_hash, codesep_pos)) = leaf_hash_code_separator {
-            engine.input(leaf_hash.as_byte_array());
+            engine.input(leaf_hash.to_byte_array());
             engine.input(&[0u8]); // key_version, for tapscript it's 0
             engine.input(&codesep_pos.to_le_bytes());
         }
