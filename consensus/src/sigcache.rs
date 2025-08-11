@@ -250,7 +250,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
 
         // 9. 写入脚本花费的数据 (如果存在)
         if let Some((leaf_hash, codesep_pos)) = leaf_hash_code_separator {
-            engine.input(leaf_hash.to_byte_array());
+            engine.input(&leaf_hash.to_byte_array());
             engine.input(&[0u8]); // key_version, for tapscript it's 0
             engine.input(&codesep_pos.to_le_bytes());
         }
