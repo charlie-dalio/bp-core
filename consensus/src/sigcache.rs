@@ -166,110 +166,97 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         sighash_type: Option<SighashType>,
     ) -> Result<TapSighash, SighashError> {
 
-        let mut hasher = tagged_hash_engine("TapSighash");
-
-        let SighashType {
-            flag: sighash_flag,
-            anyone_can_pay,
-        } = sighash_type.unwrap_or_default();
-        let common_cache = *self.common_cache();
-        let taproot_cache = *self.taproot_cache();
-
-
         let tx = self.tx.borrow();
-        hasher.input(&[0u8]); // epoch
-        hasher.input(&[sighash_type.unwrap_or_default().into_consensus_u8()]);
+        let sighash_type = sighash_type.unwrap_or_default();
+        let (sighash_flag, anyone_can_pay) = (sighash_type.flag, sighash_type.anyone_can_pay);
 
-        tx.version.consensus_encode(&mut hasher)?;
-        tx.lock_time.consensus_encode(&mut hasher)?;
+        // 1. 创建带 "TapSighash" 标记的哈希引擎
+        let mut engine = tagged_hash_engine("TapSighash");
 
-        // If the hash_type & 0x80 does not equal SIGHASH_ANYONECANPAY:
-        //     sha_prevouts (32): the SHA256 of the serialization of all input
-        // outpoints.     sha_amounts (32): the SHA256 of the serialization of
-        // all spent output amounts.     sha_scriptpubkeys (32): the SHA256 of
-        // the serialization of all spent output scriptPubKeys.
-        // sha_sequences (32): the SHA256 of the serialization of all
-        // input nSequence.
+        // 2. 写入头部数据 (8 字节)
+        engine.input(&[0u8]); // epoch
+        engine.input(&[sighash_type.into_consensus_u8()]);
+        engine.input(&tx.version.to_consensus_u32().to_le_bytes());
+        engine.input(&tx.lock_time.to_consensus_u32().to_le_bytes());
+
+        // 3. 写入 Prevouts, Amounts, ScriptPubkeys, Sequences 的哈希 (4 * 32 = 128 字节)
         if !anyone_can_pay {
-            hasher.input(&common_cache.prevouts.to_byte_array());
-            hasher.input(&taproot_cache.amounts.to_byte_array());
-            hasher.input(&taproot_cache.script_pubkeys.to_byte_array());
-            hasher.input(&common_cache.sequences.to_byte_array());
+            let mut prevouts_hasher = sha256::Hash::engine();
+            let mut amounts_hasher = sha256::Hash::engine();
+            let mut scriptpubkeys_hasher = sha256::Hash::engine();
+            let mut sequences_hasher = sha256::Hash::engine();
+
+            for i in 0..tx.inputs.len() {
+                tx.inputs[i].prev_output.consensus_encode(&mut prevouts_hasher)?;
+                self.prevouts[i].borrow().value.consensus_encode(&mut amounts_hasher)?;
+                self.prevouts[i].borrow().script_pubkey.consensus_encode(&mut scriptpubkeys_hasher)?;
+                tx.inputs[i].sequence.consensus_encode(&mut sequences_hasher)?;
+            }
+
+            engine.input(sha256::Hash::from_engine(prevouts_hasher).as_byte_array());
+            engine.input(sha256::Hash::from_engine(amounts_hasher).as_byte_array());
+            engine.input(sha256::Hash::from_engine(scriptpubkeys_hasher).as_byte_array());
+            engine.input(sha256::Hash::from_engine(sequences_hasher).as_byte_array());
         }
 
-        // If hash_type & 3 does not equal SIGHASH_NONE or SIGHASH_SINGLE:
-        //     sha_outputs (32): the SHA256 of the serialization of all outputs in
-        // CTxOut format.
+        // 4. 写入 Outputs 哈希 (32 字节)
         if sighash_flag != SighashFlag::None && sighash_flag != SighashFlag::Single {
-            hasher.input(&common_cache.outputs.to_byte_array());
+            let mut outputs_hasher = sha256::Hash::engine();
+            for output in &tx.outputs {
+                output.consensus_encode(&mut outputs_hasher)?;
+            }
+            engine.input(sha256::Hash::from_engine(outputs_hasher).as_byte_array());
         }
 
-        // * Data about this input:
-        // spend_type (1): equal to (ext_flag * 2) + annex_present, where annex_present
-        // is 0 if no annex is present, or 1 otherwise
+        // 5. 写入 Spend Type (1 字节)
         let mut spend_type = 0u8;
         if annex.is_some() {
-            spend_type |= 1u8;
+            spend_type |= 1;
         }
         if leaf_hash_code_separator.is_some() {
-            spend_type |= 2u8;
+            spend_type |= 2;
         }
-        hasher.input(&[spend_type]);
+        engine.input(&[spend_type]);
 
-        // If hash_type & 0x80 equals SIGHASH_ANYONECANPAY:
-        //      outpoint (36): the COutPoint of this input (32-byte hash + 4-byte
-        // little-endian).      amount (8): value of the previous output spent
-        // by this input.      scriptPubKey (35): scriptPubKey of the previous
-        // output spent by this input, serialized as script inside CTxOut. Its
-        // size is always 35 bytes.      nSequence (4): nSequence of this input.
+        // 6. 写入当前输入的数据
         if anyone_can_pay {
-            let txin = tx.inputs.get(input_index).ok_or_else(|| SighashError::InvalidInputIndex {
-                txid: tx.txid(),
-                index: input_index,
-                inputs: tx.inputs.len(),
-            })?;
-            let previous_output = self.prevouts[input_index].borrow();
-            txin.prev_output.consensus_encode(&mut hasher)?;
-            previous_output.value.consensus_encode(&mut hasher)?;
-            previous_output.script_pubkey.consensus_encode(&mut hasher)?;
-            txin.sequence.consensus_encode(&mut hasher)?;
+            // outpoint (36) + amount (8) + scriptPubKey (var_int + bytes) + nSequence (4)
+            let txin = &tx.inputs[input_index];
+            let prevout = self.prevouts[input_index].borrow();
+            txin.prev_output.consensus_encode(&mut engine)?;
+            prevout.value.consensus_encode(&mut engine)?;
+            prevout.script_pubkey.consensus_encode(&mut engine)?;
+            txin.sequence.consensus_encode(&mut engine)?;
         } else {
-            hasher.input(&(input_index as u32).to_le_bytes());
+            // input_index (4)
+            engine.input(&(input_index as u32).to_le_bytes());
         }
 
-        // If an annex is present (the lowest bit of spend_type is set):
-        //      sha_annex (32): the SHA256 of (compact_size(size of annex) || annex),
-        // where annex      includes the mandatory 0x50 prefix.
+        // 7. 写入 Annex 哈希 (32 字节, 如果存在)
         if let Some(annex) = annex {
-            let mut enc = sha256::Hash::engine();
-            annex.consensus_encode(&mut enc)?;
-            let hash = sha256::Hash::from_engine(enc);
-            hasher.input(hash.as_byte_array());
+            let mut annex_hasher = sha256::Hash::engine();
+            annex.consensus_encode(&mut annex_hasher)?;
+            engine.input(sha256::Hash::from_engine(annex_hasher).as_byte_array());
         }
 
-        // * Data about this output:
-        // If hash_type & 3 equals SIGHASH_SINGLE:
-        //      sha_single_output (32): the SHA256 of the corresponding output in CTxOut
-        // format.
+        // 8. 写入 SIGHASH_SINGLE 的 Output 哈希 (32 字节)
         if sighash_flag == SighashFlag::Single {
-            let output = tx.outputs.get(input_index).ok_or_else(|| SighashError::NoSingleOutputMatch {
-                txid: tx.txid(),
-                index: input_index,
-                outputs: tx.outputs.len(),
-            })?;
-            let mut enc = sha256::Hash::engine();
-            output.consensus_encode(&mut enc)?;
-            let hash = sha256::Hash::from_engine(enc);
-            hasher.input(hash.as_byte_array());
+            let output = tx.outputs.get(input_index)
+                .ok_or(SighashError::NoSingleOutputMatch { txid: tx.txid(), index: input_index, outputs: tx.outputs.len() })?;
+            let mut single_output_hasher = sha256::Hash::engine();
+            output.consensus_encode(&mut single_output_hasher)?;
+            engine.input(sha256::Hash::from_engine(single_output_hasher).as_byte_array());
         }
 
-        if let Some((hash, code_separator_pos)) = leaf_hash_code_separator {
-            hasher.input(&hash.to_byte_array());
-            hasher.input(&[0u8]);
-            hasher.input(&code_separator_pos.to_le_bytes());
+        // 9. 写入脚本花费的数据 (如果存在)
+        if let Some((leaf_hash, codesep_pos)) = leaf_hash_code_separator {
+            engine.input(leaf_hash.as_byte_array());
+            engine.input(&[0u8]); // key_version, for tapscript it's 0
+            engine.input(&codesep_pos.to_le_bytes());
         }
 
-        Ok(TapSighash::from_engine(hasher))
+        // 10. 计算并返回最终的 Sighash
+        Ok(TapSighash::from_engine(engine))
     }
 
     /// Computes the BIP341 sighash for a key spend.
