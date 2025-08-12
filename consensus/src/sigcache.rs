@@ -171,26 +171,14 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
             None => (0x00, false, SighashFlag::All), // 默认情况
             Some(sht) => (sht.into_consensus_u8(), sht.anyone_can_pay, sht.flag),
         };
-        println!("\n\n=============== SIGHASH PREIMAGE BREAKDOWN ===============");
         // 1. 创建带 "TapSighash" 标记的哈希引擎
         let mut engine = tagged_hash_engine("TapSighash");
 
         // 2. 写入头部数据 (8 字节)
-        let epoch = &[0u8];
-        println!("[ 1] Epoch (1 byte):           {}", amplify::hex::ToHex::to_hex(&epoch[..]));
-        engine.input(epoch);
-
-        let sht = &[sighash_u8];
-        println!("[ 2] SighashType (1 byte):       {}", amplify::hex::ToHex::to_hex(&sht[..]));
-        engine.input(sht);
-
-        let ver = &tx.version.to_consensus_i32().to_le_bytes();
-        println!("[ 3] Version (4 bytes):          {}", amplify::hex::ToHex::to_hex(&ver[..]));
-        engine.input(ver);
-
-        let lock = &tx.lock_time.to_consensus_u32().to_le_bytes();
-        println!("[ 4] LockTime (4 bytes):         {}", amplify::hex::ToHex::to_hex(&lock[..]));
-        engine.input(lock);
+        engine.input(&[0u8]); // epoch
+        engine.input(&[sighash_u8]);
+        engine.input(&tx.version.to_consensus_i32().to_le_bytes());
+        engine.input(&tx.lock_time.to_consensus_u32().to_le_bytes());
 
         // 3. 写入 Prevouts, Amounts, ScriptPubkeys, Sequences 的哈希 (4 * 32 = 128 字节)
         if !anyone_can_pay {
@@ -206,21 +194,10 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
                 tx.inputs[i].sequence.consensus_encode(&mut sequences_hasher)?;
             }
 
-            let sha_prevouts = sha256::Hash::from_engine(prevouts_hasher);
-            println!("[ 5] sha_prevouts (32 bytes):    {}", sha_prevouts);
-            engine.input(sha_prevouts.as_byte_array());
-
-            let sha_amounts = sha256::Hash::from_engine(amounts_hasher);
-            println!("[ 6] sha_amounts (32 bytes):     {}", sha_amounts);
-            engine.input(sha_amounts.as_byte_array());
-
-            let sha_scriptpubkeys = sha256::Hash::from_engine(scriptpubkeys_hasher);
-            println!("[ 7] sha_scriptpubkeys (32 B): {}", sha_scriptpubkeys);
-            engine.input(sha_scriptpubkeys.as_byte_array());
-
-            let sha_sequences = sha256::Hash::from_engine(sequences_hasher);
-            println!("[ 8] sha_sequences (32 bytes):   {}", sha_sequences);
-            engine.input(sha_sequences.as_byte_array());
+            engine.input(sha256::Hash::from_engine(prevouts_hasher).as_byte_array());
+            engine.input(sha256::Hash::from_engine(amounts_hasher).as_byte_array());
+            engine.input(sha256::Hash::from_engine(scriptpubkeys_hasher).as_byte_array());
+            engine.input(sha256::Hash::from_engine(sequences_hasher).as_byte_array());
         }
 
         // 4. 写入 Outputs 哈希 (32 字节)
@@ -229,17 +206,14 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
             for output in &tx.outputs {
                 output.consensus_encode(&mut outputs_hasher)?;
             }
-            let sha_outputs = sha256::Hash::from_engine(outputs_hasher);
-            println!("[ 9] sha_outputs (32 bytes):     {}", sha_outputs);
-            engine.input(sha_outputs.as_byte_array());
+            engine.input(sha256::Hash::from_engine(outputs_hasher).as_byte_array());
         }
 
         // 5. 写入 Spend Type (1 字节)
-        let mut spend_type_byte = 0u8;
-        if annex.is_some() { spend_type_byte |= 1; }
-        if leaf_hash_code_separator.is_some() { spend_type_byte |= 2; }
-        println!("[10] Spend Type (1 byte):        {:02x}", spend_type_byte);
-        engine.input(&[spend_type_byte]);
+        let mut spend_type = 0u8;
+        if annex.is_some() { spend_type |= 1; }
+        if leaf_hash_code_separator.is_some() { spend_type |= 2; }
+        engine.input(&[spend_type]);
 
         // 6. 写入当前输入的数据
         if anyone_can_pay {
@@ -251,9 +225,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
             prevout.script_pubkey.consensus_encode(&mut engine)?;
             txin.sequence.consensus_encode(&mut engine)?;
         } else {
-            let idx = &(input_index as u32).to_le_bytes();
-            println!("[11] Input Index (4 bytes):      {}", amplify::hex::ToHex::to_hex(&idx[..]));
-            engine.input(idx);
+            engine.input(&(input_index as u32).to_le_bytes());
         }
 
         // 7. 写入 Annex 哈希 (如果存在)
@@ -274,20 +246,11 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
 
         // 9. 写入脚本花费的数据 (如果存在)
         if let Some((leaf_hash, codesep_pos)) = leaf_hash_code_separator {
-            let lh = leaf_hash.to_byte_array();
-            println!("[12] Leaf Hash (32 bytes):       {}", amplify::hex::ToHex::to_hex(&lh[..]));
-            engine.input(&lh);
-
-            let kv = &[0u8];
-            println!("[13] Key Version (1 byte):       {}", amplify::hex::ToHex::to_hex(&kv[..]));
-            engine.input(kv);
-
-            let csp = &codesep_pos.to_le_bytes();
-            println!("[14] Codesep Pos (4 bytes):      {}", amplify::hex::ToHex::to_hex(&csp[..]));
-            engine.input(csp);
+            engine.input(&leaf_hash.to_byte_array());
+            engine.input(&[0u8]); // key_version
+            engine.input(&codesep_pos.to_le_bytes());
         }
 
-        println!("======================================================\n");
 
         // 10. 计算并返回最终的 Sighash
         Ok(TapSighash::from_engine(engine))
