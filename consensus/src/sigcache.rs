@@ -175,19 +175,19 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
 
         // 2. 写入头部数据 (8 字节)
         let epoch = &[0u8];
-        println!("[ 1] Epoch (1 byte):           {}", amplify::hex::ToHex::to_hex(epoch));
+        println!("[ 1] Epoch (1 byte):           {}", amplify::hex::ToHex::to_hex(&epoch[..]));
         engine.input(epoch);
 
         let sht = &[sighash_type.into_consensus_u8()];
-        println!("[ 2] SighashType (1 byte):       {}", amplify::hex::ToHex::to_hex(sht));
+        println!("[ 2] SighashType (1 byte):       {}", amplify::hex::ToHex::to_hex(&sht[..]));
         engine.input(sht);
 
         let ver = &tx.version.to_consensus_i32().to_le_bytes();
-        println!("[ 3] Version (4 bytes):          {}", amplify::hex::ToHex::to_hex(ver));
+        println!("[ 3] Version (4 bytes):          {}", amplify::hex::ToHex::to_hex(&ver[..]));
         engine.input(ver);
 
         let lock = &tx.lock_time.to_consensus_u32().to_le_bytes();
-        println!("[ 4] LockTime (4 bytes):         {}", amplify::hex::ToHex::to_hex(lock));
+        println!("[ 4] LockTime (4 bytes):         {}", amplify::hex::ToHex::to_hex(&lock[..]));
         engine.input(lock);
 
         // 3. 写入 Prevouts, Amounts, ScriptPubkeys, Sequences 的哈希 (4 * 32 = 128 字节)
@@ -250,7 +250,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
             txin.sequence.consensus_encode(&mut engine)?;
         } else {
             let idx = &(input_index as u32).to_le_bytes();
-            println!("[11] Input Index (4 bytes):      {}", amplify::hex::ToHex::to_hex(idx));
+            println!("[11] Input Index (4 bytes):      {}", amplify::hex::ToHex::to_hex(&idx[..]));
             engine.input(idx);
         }
 
@@ -273,15 +273,15 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         // 9. 写入脚本花费的数据 (如果存在)
         if let Some((leaf_hash, codesep_pos)) = leaf_hash_code_separator {
             let lh = leaf_hash.to_byte_array();
-            println!("[12] Leaf Hash (32 bytes):       {}", amplify::hex::ToHex::to_hex(&lh));
+            println!("[12] Leaf Hash (32 bytes):       {}", amplify::hex::ToHex::to_hex(&lh[..]));
             engine.input(&lh);
 
             let kv = &[0u8];
-            println!("[13] Key Version (1 byte):       {}", amplify::hex::ToHex::to_hex(kv));
+            println!("[13] Key Version (1 byte):       {}", amplify::hex::ToHex::to_hex(&kv[..]));
             engine.input(kv);
 
             let csp = &codesep_pos.to_le_bytes();
-            println!("[14] Codesep Pos (4 bytes):      {}", amplify::hex::ToHex::to_hex(csp));
+            println!("[14] Codesep Pos (4 bytes):      {}", amplify::hex::ToHex::to_hex(&csp[..]));
             engine.input(csp);
         }
 
