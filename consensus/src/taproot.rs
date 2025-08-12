@@ -49,8 +49,7 @@ use crate::{
 
 // [最终修复] 创建一个保证符合 BIP-340 规范的标记哈希引擎的辅助函数
 fn tagged_hash_engine(tag: &[u8]) -> sha256::HashEngine {
-    // 关键修正：必须使用单次 SHA256 哈希引擎来处理 tag，
-    // 而不是使用执行双重哈希的 .hash() 函数。
+    // 关键修正：必须使用单次 SHA256 哈希引擎来处理 tag
     let mut tag_engine = sha256::Hash::engine();
     tag_engine.input(tag);
     let tag_hash = sha256::Hash::from_engine(tag_engine);
