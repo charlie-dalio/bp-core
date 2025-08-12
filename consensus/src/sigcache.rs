@@ -167,8 +167,10 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
     ) -> Result<TapSighash, SighashError> {
 
         let tx = self.tx.borrow();
-        let sighash_type = sighash_type.unwrap_or_default();
-        let (sighash_flag, anyone_can_pay) = (sighash_type.flag, sighash_type.anyone_can_pay);
+        let (sighash_u8, anyone_can_pay, sighash_flag) = match sighash_type {
+            None => (0x00, false, SighashFlag::All), // 默认情况
+            Some(sht) => (sht.into_consensus_u8(), sht.anyone_can_pay, sht.flag),
+        };
         println!("\n\n=============== SIGHASH PREIMAGE BREAKDOWN ===============");
         // 1. 创建带 "TapSighash" 标记的哈希引擎
         let mut engine = tagged_hash_engine("TapSighash");
@@ -178,7 +180,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
         println!("[ 1] Epoch (1 byte):           {}", amplify::hex::ToHex::to_hex(&epoch[..]));
         engine.input(epoch);
 
-        let sht = &[sighash_type.into_consensus_u8()];
+        let sht = &[sighash_u8];
         println!("[ 2] SighashType (1 byte):       {}", amplify::hex::ToHex::to_hex(&sht[..]));
         engine.input(sht);
 
@@ -254,7 +256,7 @@ impl<Prevout: Borrow<TxOut>, Tx: Borrow<Transaction>> SighashCache<Prevout, Tx> 
             engine.input(idx);
         }
 
-        // 7. 写入 Annex 哈希 (32 字节, 如果存在)
+        // 7. 写入 Annex 哈希 (如果存在)
         if let Some(annex) = annex {
             let mut annex_hasher = sha256::Hash::engine();
             annex.consensus_encode(&mut annex_hasher)?;
